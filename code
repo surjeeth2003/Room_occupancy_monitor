@@ -1,0 +1,165 @@
+#include "stm32f4xx.h"
+#include <stdio.h>
+
+void GPIO_Config(void);
+void UART2_Config(void);
+void TIM2_Config(void);
+void delay_us(unsigned int us);
+void trigger_sensor_outer(void);
+void trigger_sensor_inner(void);
+void send_message_via_bluetooth(const char *message);
+void EXTI1_IRQHandler(void);
+void EXTI9_5_IRQHandler(void);
+
+int counter = 0;
+int distance_outer_cm = 0;
+int distance_inner_cm = 0;
+unsigned int start_time_outer = 0;
+unsigned int end_time_outer = 0;
+unsigned int start_time_inner = 0;
+unsigned int end_time_inner = 0;
+
+int outer_sensor_flag = 0;
+int inner_sensor_flag = 0;
+int entry_triggered = 0;
+int exit_triggered = 0;
+
+int main(void) {
+    GPIO_Config();
+    UART2_Config();
+    TIM2_Config();
+
+    while (1) {
+        trigger_sensor_outer();
+        trigger_sensor_inner();
+
+        // Entry logic: Outer sensor detected first, then inner sensor
+        if (outer_sensor_flag && inner_sensor_flag && entry_triggered) {
+            counter++;
+            char message[50];
+            sprintf(message, "Entered Room, Count: %d", counter);
+            send_message_via_bluetooth(message);
+            outer_sensor_flag = 0;
+            inner_sensor_flag = 0;
+            entry_triggered = 0;
+        }
+
+        // Exit logic: Inner sensor detected first, then outer sensor
+        if (inner_sensor_flag && outer_sensor_flag && exit_triggered) {
+            if (counter > 0) {
+                counter--;
+                char message[50];
+                sprintf(message, "Exited Room, Count: %d", counter);
+                send_message_via_bluetooth(message);
+            }
+            inner_sensor_flag = 0;
+            outer_sensor_flag = 0;
+            exit_triggered = 0;
+        }
+
+        for (int i = 0; i < 100000; i++); // Small delay
+    }
+}
+
+void GPIO_Config(void) {
+    RCC->AHB1ENR |= (1 << 0);  // Enable GPIOA clock
+    GPIOA->MODER |= (1 << 0) | (1 << 8);  // Output for trigger pins
+    GPIOA->OTYPER &= ~((1 << 0) | (1 << 4));
+    GPIOA->OSPEEDR |= (3 << 0) | (3 << 8);
+    
+    GPIOA->MODER &= ~((3 << 2) | (3 << 10));  // Set as input for echo pins
+    GPIOA->MODER |= (2 << 4) | (2 << 6);
+    GPIOA->AFR[0] |= (7 << 8) | (7 << 12);
+
+    RCC->APB2ENR |= (1 << 14); // Enable SYSCFG clock
+    SYSCFG->EXTICR[0] &= ~(0xF << 4);
+    EXTI->IMR |= (1 << 1);
+    EXTI->FTSR |= (1 << 1);
+    EXTI->RTSR |= (1 << 1);
+
+    SYSCFG->EXTICR[1] &= ~(0xF << 4);
+    EXTI->IMR |= (1 << 5);
+    EXTI->FTSR |= (1 << 5);
+    EXTI->RTSR |= (1 << 5);
+
+    NVIC_EnableIRQ(EXTI1_IRQn);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+void UART2_Config(void) {
+    RCC->APB1ENR |= (1 << 17);  // Enable UART2 clock
+    USART2->BRR = 0x0683;
+    USART2->CR1 |= (1 << 3) | (1 << 2) | (1 << 13);
+}
+
+void TIM2_Config(void) {
+    RCC->APB1ENR |= (1 << 0);  // Enable TIM2 clock
+    TIM2->PSC = 84 - 1;
+    TIM2->ARR = 0xFFFFFFFF;
+    TIM2->CNT = 0;
+    TIM2->CR1 |= (1 << 2);
+}
+
+void delay_us(unsigned int us) {
+    unsigned int count = 84 * us;
+    while (count--) {
+        __NOP();
+    }
+}
+
+void trigger_sensor_outer(void) {
+    GPIOA->ODR |= (1 << 0);   // Outer sensor trigger
+    delay_us(10);
+    GPIOA->ODR &= ~(1 << 0);
+}
+
+void trigger_sensor_inner(void) {
+    GPIOA->ODR |= (1 << 4);   // Inner sensor trigger
+    delay_us(10);
+    GPIOA->ODR &= ~(1 << 4);
+}
+
+void EXTI1_IRQHandler(void) {
+    if (EXTI->PR & (1U << 1)) {
+        EXTI->PR |= (1U << 1);  // Clear interrupt flag
+        if (GPIOA->IDR & (1 << 1)) {
+            TIM2->CNT = 0;
+            TIM2->CR1 |= (1 << 0);
+        } else {
+            TIM2->CR1 &= ~(1 << 0);
+            end_time_outer = TIM2->CNT;
+            distance_outer_cm = (end_time_outer * 0.0343) / 2;
+            if (distance_outer_cm < 100) {
+                outer_sensor_flag = 1;
+                entry_triggered = 1;  // Entry sequence initiated
+            }
+        }
+    }
+}
+
+void EXTI9_5_IRQHandler(void) {
+    if (EXTI->PR & (1U << 5)) {
+        EXTI->PR |= (1U << 5);  // Clear interrupt flag
+        if (GPIOA->IDR & (1 << 5)) {
+            TIM2->CNT = 0;
+            TIM2->CR1 |= (1 << 0);
+        } else {
+            TIM2->CR1 &= ~(1 << 0);
+            end_time_inner = TIM2->CNT;
+            distance_inner_cm = (end_time_inner * 0.0343) / 2;
+            if (distance_inner_cm < 100) {
+                inner_sensor_flag = 1;
+                exit_triggered = 1;  // Exit sequence initiated
+            }
+        }
+    }
+}
+
+void send_message_via_bluetooth(const char *message) {
+    for (const char *p = message; *p != '\0'; p++) {
+        while (!(USART2->SR & (1 << 7)));
+        USART2->DR = *p;
+    }
+    while (!(USART2->SR & (1 << 7)));
+    USART2->DR = '\n';
+}
